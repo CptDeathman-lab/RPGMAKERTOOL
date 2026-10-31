@@ -11,6 +11,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from choice_support import choice_groups, choice_topology
 
 
 class SafetyError(ValueError):
@@ -115,6 +116,7 @@ class MapDocument:
         # Keys refer to ORIGINAL command positions, so resizing one message cannot
         # shift the identity of subsequent messages or unrelated commands.
         self.edits: dict[tuple[int, int, int], tuple[str, ...]] = {}
+        self.choice_edits: dict[tuple[int, int, int], tuple[str, ...]] = {}
 
     def page(self, event_index: int, page_index: int):
         return self.data["events"][event_index]["pages"][page_index]["list"]
@@ -148,9 +150,42 @@ class MapDocument:
         self.data = self._expected(proposed)
         self.edits = proposed
 
-    def _expected(self, edits=None):
+    def edit_choice(self, event_index: int, page_index: int, header_index: int, option_index: int, label: str):
+        self.validate(self.data)
+        commands = self.original["events"][event_index]["pages"][page_index]["list"]
+        group = next((g for g in choice_groups(commands) if g.header_index == header_index), None)
+        if group is None or group.problem:
+            raise SafetyError(group.problem if group else "No existing choice group at that command.")
+        if type(option_index) is not int or not 0 <= option_index < len(group.labels):
+            raise SafetyError("Only existing choice labels can be edited; no adding/removing/reordering options.")
+        if not isinstance(label, str) or "\n" in label or "\r" in label:
+            raise SafetyError("A choice label must remain a single line.")
+        if escape_codes(label) != escape_codes(group.labels[option_index]):
+            raise SafetyError("Choice escape codes must remain intact and in the same order.")
+        key = event_index, page_index, header_index
+        proposed = dict(self.choice_edits)
+        labels = list(proposed.get(key, group.labels))
+        labels[option_index] = label
+        if tuple(labels) == group.labels:
+            proposed.pop(key, None)
+        else:
+            proposed[key] = tuple(labels)
+        self.data = self._expected(choice_edits=proposed)
+        self.choice_edits = proposed
+
+    def _expected(self, edits=None, choice_edits=None):
         edits = self.edits if edits is None else edits
+        choice_edits = self.choice_edits if choice_edits is None else choice_edits
         expected = copy.deepcopy(self.original)
+        # Apply paired label edits at ORIGINAL offsets before any 401 splicing.
+        for (event, page, header), labels in choice_edits.items():
+            original = self.original["events"][event]["pages"][page]["list"]
+            group = next(g for g in choice_groups(original) if g.header_index == header)
+            target = expected["events"][event]["pages"][page]["list"]
+            target[header]["parameters"][0] = list(labels)
+            for branch in group.branches:
+                if branch.option_index is not None:
+                    target[branch.header_index]["parameters"][1] = labels[branch.option_index]
         # Descending ORIGINAL positions avoid index drift across multiple edits.
         for (event, page, header), lines in sorted(edits.items(), reverse=True):
             original = self.original["events"][event]["pages"][page]["list"]
@@ -167,6 +202,12 @@ class MapDocument:
 
     def validate(self, candidate):
         expected = self._expected()
+        touched = {(event, page) for event, page, _ in (*self.edits, *self.choice_edits)}
+        for event, page in touched:
+            before = self.original["events"][event]["pages"][page]["list"]
+            after = candidate["events"][event]["pages"][page]["list"]
+            if choice_topology(before) != choice_topology(after):
+                raise SafetyError("Choice branch mapping or gameplay settings changed. Save refused.")
         # Serialized comparison also distinguishes JSON booleans from numbers.
         if json.dumps(candidate, sort_keys=True, allow_nan=False) != json.dumps(expected, sort_keys=True, allow_nan=False):
             raise SafetyError("Changes outside the intended dialogue detected. Save refused.")
@@ -213,6 +254,7 @@ class MapDocument:
         self.raw = payload
         self.original = copy.deepcopy(self.data)
         self.edits.clear()
+        self.choice_edits.clear()
         return backup
 
 

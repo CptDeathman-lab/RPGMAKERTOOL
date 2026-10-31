@@ -157,5 +157,131 @@ class GuiTests(unittest.TestCase):
         self.assertEqual((self.source / "data" / "Map001.json").read_bytes(), self.source_raw)
 
 
+@unittest.skipUnless(os.name == "nt" or os.environ.get("DISPLAY"), "Needs a real or virtual desktop display")
+class ChoiceGuiTests(unittest.TestCase):
+    # Reuse the desktop/project setup without inheriting the message-only tests.
+    edit = GuiTests.edit
+    tearDown = GuiTests.tearDown
+
+    def setUp(self):
+        GuiTests.setUp(self)
+        from test_choices import bedtime_commands
+        self.commands = bedtime_commands()
+        data = {"events": [None, None, None, None, {"id": 4, "name": "Bedtime", "pages": [{"list": self.commands}]}]}
+        self.source_raw = json.dumps(data).encode()
+        (self.source / "data" / "Map002.json").write_bytes(self.source_raw)
+        (self.root / "data" / "Map002.json").write_bytes(self.source_raw)
+        self.app.selection = (4, 0)
+        self.app.document = MapDocument(self.root, self.root / "data" / "Map002.json")
+        self.app.render(messages(self.app.document.page(4, 0)))
+        self.window.update()
+
+    def test_overview_choices_branch_ownership_and_gameplay_details(self):
+        overview = self.app.scene.get("1.0", "end-1c")
+        for text in ["Do you want to go to bed?", "Show Choices", "1. Yes", "2. No", "When Yes", "When No", "When Cancel",
+                     "Fade out BGM (242)", "Fade out screen (221)", "Variables (122)", "StoryProgress cancelBed"]:
+            self.assertIn(text, overview)
+        self.assertLess(overview.index("When Yes"), overview.index("Fade out BGM"))
+        self.assertLess(overview.index("Fade out BGM"), overview.index("When No"))
+        self.assertGreater(overview.index("Stay awake."), overview.index("When No"))
+        self.assertGreater(overview.index("StoryProgress cancelBed"), overview.index("When Cancel"))
+        self.assertIn((2, 0), self.app.choice_ranges)
+        self.assertIn((8, 1), self.app.choice_ranges)
+        self.assertIn("Map002 · Event 004 · Page 1", self.app.page_title.get())
+
+    def test_choice_and_branch_dialogue_edits_survive_navigation_and_save(self):
+        from choice_support import choice_groups, choice_topology
+        self.app.go_choice(2, 0)
+        self.edit("Yes, please")
+        self.assertTrue(self.app.dirty())
+        self.app.go_message(0)
+        self.edit("A question:\nDo you want to go to bed?")
+        self.app.go_message(1)
+        self.edit("Sleep well.\nGood night.")
+        self.app.go_choice(8, 1)
+        self.edit("Wait a little")
+        self.assertTrue(self.app.save())
+        self.window.update()
+        cs = self.app.document.page(4, 0)
+        groups = choice_groups(cs)
+        self.assertEqual(groups[0].labels[0], "Yes, please")
+        self.assertEqual(groups[1].labels[1], "Wait a little")
+        self.assertEqual(choice_topology(cs), choice_topology(self.commands))
+        self.assertEqual(self.app.active_choice, (groups[1].header_index, 1))
+        self.assertFalse(self.app.dirty())
+        self.assertEqual((self.source / "data" / "Map002.json").read_bytes(), self.source_raw)
+        self.assertEqual(next((self.root / "dialogue_backups").glob("Map002*.json")).read_bytes(), self.source_raw)
+
+    def test_collapse_and_nested_dialogue_navigation_reveal_ancestors(self):
+        self.app.collapsed_branches.update({(2, 3), (8, 12)})
+        self.app.update_overview()
+        self.assertEqual(str(self.app.scene.tag_cget("collapse_2_3", "elide")), "1")
+        self.app.go_message(2)  # The nested Wait branch's dialogue.
+        self.assertNotIn((2, 3), self.app.collapsed_branches)
+        self.assertNotIn((8, 12), self.app.collapsed_branches)
+        # Toggle the outer branch through its real mouse binding.
+        first, last, key = next(r for r in self.app.branch_ranges if r[2] == (2, 3))
+        self.app.scene.see(first)
+        self.window.update()
+        bounds = self.app.scene.bbox(first)
+        self.assertIsNotNone(bounds)
+        self.app.scene.event_generate("<Button-1>", x=bounds[0]+2, y=bounds[1]+2)
+        self.window.update()
+        self.assertIn(key, self.app.collapsed_branches)
+        self.assertFalse(self.app.dirty())
+        self.app.query.insert(0, "Wait a")
+        # Search a choice label hidden inside the collapsed outer branch.
+        self.app.query.delete(0, "end")
+        self.app.query.insert(0, "Sleep now")
+        self.app.find_next()
+        self.assertEqual(self.app.active_choice, (8, 0))
+        self.assertNotIn((2, 3), self.app.collapsed_branches)
+
+    def test_live_choice_width_warning_is_advisory_and_newline_is_refused(self):
+        self.app.go_choice(2, 0)
+        self.edit("W" * 100)
+        self.assertIn("Choice window overflow", self.app.width_warning.cget("text"))
+        self.app.update_overview()
+        self.assertIn("Choice window overflow", self.app.scene.get("1.0", "end-1c"))
+        self.assertTrue(self.app.save())  # Width warning does not silently truncate or reject text.
+        self.edit("Two\nlines")
+        before = (self.root / "data" / "Map002.json").read_bytes()
+        with patch("dragontail_dialogue_manager.messagebox.showerror") as error:
+            self.assertFalse(self.app.save())
+            error.assert_called_once()
+        self.assertEqual((self.root / "data" / "Map002.json").read_bytes(), before)
+
+    def test_choice_only_page_supports_editing_and_unsaved_cancel(self):
+        cs = [command(102, [["Yes", "No"], -1, 0, 2, 0]), command(402, [0, "Yes"]),
+              command(0, [], 1), command(402, [1, "No"]), command(0, [], 1), command(404, []), command(0, [])]
+        data = {"events": [None, None, None, None, {"id": 4, "pages": [{"list": cs}]}]}
+        path = self.root / "data" / "Map002.json"
+        path.write_text(json.dumps(data))
+        self.app.document = MapDocument(self.root, path)
+        self.app.render([])
+        self.assertEqual(self.app.active_choice, (0, 0))
+        self.assertEqual(str(self.app.editor.cget("state")), "normal")
+        self.edit("Certainly")
+        with patch("dragontail_dialogue_manager.messagebox.askyesnocancel", return_value=None):
+            self.assertFalse(self.app.can_leave())
+        self.assertTrue(self.app.save())
+        self.assertEqual(self.app.document.page(4, 0)[1]["parameters"], [0, "Certainly"])
+        self.app.revert()
+        self.assertEqual(self.app.editor.get("1.0", "end-1c"), "Certainly")
+
+    def test_malformed_choice_labels_are_displayed_but_not_editable(self):
+        path = self.root / "data" / "Map002.json"
+        data = decode(path.read_bytes())
+        data["events"][4]["pages"][0]["list"][3]["parameters"][1] = "Out of sync"
+        path.write_text(json.dumps(data))
+        self.app.document = MapDocument(self.root, path)
+        self.app.render(messages(self.app.document.page(4, 0)))
+        self.assertIn("READ-ONLY", self.app.scene.get("1.0", "end-1c"))
+        self.assertNotIn((2, 0), self.app.choice_ranges)
+        self.app.go_choice(2, 0)
+        self.assertIsNone(self.app.active_choice)
+        self.assertEqual(self.app.current, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

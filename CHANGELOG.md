@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3 — Choices preview
+
+- Detect existing Show Choices (102) and pair each option with its indexed When branch (402), including nested choices and When Cancel (403).
+- Show collapsible branches with their own dialogue and read-only gameplay commands.
+- Edit existing single-line labels and synchronize 102/402 strings without changing option counts/order, indices, or cancel/default settings.
+- Validate choice topology and the complete map before writing; retain exact-byte backups and all v0.2 editing behavior.
+- Add shared advisory width checks for message/choice text with explicit font/plugin limitations; no existing checker was present in the available v0.2 source.
+- Include a temporary-copy verifier for a real map/event/page. Actual DragonTail Map002/Event 004 testing is pending provision of that file or local verification.
+- Preserve v0.1, main, and the v0.2 branch/tag unchanged.
+
 ## 0.2
 
 - Allow one–four lines in each existing message while preserving its code 101 header, settings, escape codes, and surrounding commands.
