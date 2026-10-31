@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from dialogue_core import MapDocument, SafetyError, create_working_copy, decode, messages, escape_codes
 
@@ -55,13 +56,107 @@ class DialogueTests(unittest.TestCase):
         second_backup = self.doc.save()
         self.assertEqual(decode(second_backup.read_bytes()), expected)
 
-    def test_reject_added_lines_and_modified_escape_codes(self):
+    def test_reject_modified_escape_codes_and_embedded_newlines(self):
         for lines in [["Extra", "line", "here"], ["Lost code", r"\C[2]DragonTail\C[0] awaits.\!"],
                       [r"Hi \N[2]", r"\C[2]DragonTail\C[0] awaits.\!"],
                       ["Hello\nthere", "Next"]]:
             with self.subTest(lines=lines), self.assertRaises(SafetyError):
                 self.doc.edit(1, 0, 1, lines)
         self.assertEqual(self.doc.data, self.map)
+
+    def test_resize_multiple_messages_in_either_order_without_index_drift(self):
+        for first_count in range(1, 5):
+            for second_count in range(1, 5):
+                for order in [(1, 10), (10, 1)]:
+                    with self.subTest(first=first_count, second=second_count, order=order):
+                        doc = MapDocument(self.root, self.path)
+                        changes = {
+                            1: [r"Hi \N[1], \C[2]DragonTail\C[0]!\!"] + ["Extra"] * (first_count - 1),
+                            10: ["New second message"] + [""] * (second_count - 1),
+                        }
+                        for header in order:
+                            doc.edit(1, 0, header, changes[header])
+                        doc.validate(doc.data)
+                        edited = doc.page(1, 0)
+                        original = self.map["events"][1]["pages"][0]["list"]
+                        self.assertEqual([c for c in edited if c["code"] != 401],
+                                         [c for c in original if c["code"] != 401])
+                        blocks = messages(edited)
+                        self.assertEqual(blocks[0].lines, tuple(changes[1]))
+                        self.assertEqual(blocks[1].lines, tuple(changes[10]))
+                        self.assertTrue(all(c["indent"] == 1 for c in edited[2:2+first_count]))
+                        self.assertEqual(doc.data["events"][1]["pages"][1], self.map["events"][1]["pages"][1])
+
+    def test_resized_save_backup_and_second_save(self):
+        lines = [r"Hello \N[1]", r"\C[2]DragonTail\C[0] awaits.\!", "Third", "Fourth"]
+        self.doc.edit(1, 0, 1, lines)
+        self.doc.edit(1, 0, 10, ["Short"])
+        backup = self.doc.save()
+        self.assertEqual(backup.read_bytes(), self.raw)
+        saved = self.path.read_bytes()
+        self.assertEqual((self.source / "data" / "Map001.json").read_bytes(), self.raw)
+        blocks = messages(self.doc.page(1, 0))
+        self.assertEqual(blocks[1].header_index, 12)
+        self.doc.edit(1, 0, blocks[1].header_index, ["One", "Two"])
+        backup = self.doc.save()
+        self.assertEqual(backup.read_bytes(), saved)
+
+    def test_invalid_line_counts_and_custom_metadata(self):
+        for lines in [[], ["text"] * 5]:
+            with self.assertRaises(SafetyError):
+                self.doc.edit(1, 0, 10, lines)
+        data = copy.deepcopy(self.map)
+        data["events"][1]["pages"][0]["list"][11]["pluginMetadata"] = "retain"
+        self.path.write_text(json.dumps(data))
+        doc = MapDocument(self.root, self.path)
+        with self.assertRaises(SafetyError):
+            doc.edit(1, 0, 10, ["One", "Two"])
+        doc.edit(1, 0, 10, ["New wording"])
+        doc.save()
+        self.assertEqual(doc.page(1, 0)[11]["pluginMetadata"], "retain")
+
+    def test_original_over_four_lines_is_readonly(self):
+        data = copy.deepcopy(self.map)
+        commands = data["events"][1]["pages"][0]["list"]
+        commands[12:12] = [command(401, ["extra"])] * 4
+        self.path.write_text(json.dumps(data))
+        doc = MapDocument(self.root, self.path)
+        block = messages(doc.page(1, 0))[1]
+        doc.edit(1, 0, block.header_index, list(block.lines))
+        self.assertIsNone(doc.save())
+        with self.assertRaises(SafetyError):
+            doc.edit(1, 0, block.header_index, ["Shorter"])
+
+    def test_resizing_never_authorizes_header_or_unrelated_mutation(self):
+        self.doc.edit(1, 0, 10, ["One", "Two", "Three"])
+        self.doc.page(1, 0)[10]["parameters"][2] = 0
+        with self.assertRaises(SafetyError):
+            self.doc.save()
+        with self.assertRaises(SafetyError):
+            self.doc.edit(1, 0, 10, ["Next"])
+        self.assertEqual(self.path.read_bytes(), self.raw)
+
+    def test_json_types_preserved(self):
+        self.doc.data["events"][1]["id"] = True  # True == 1 in Python, but differs in JSON.
+        with self.assertRaises(SafetyError):
+            self.doc.save()
+
+    def test_low_disk_space_stops_before_creating_destination(self):
+        destination = self.base / "no-space"
+        with patch("dialogue_core.shutil.disk_usage", return_value=SimpleNamespace(free=0)):
+            with self.assertRaisesRegex(SafetyError, "No copy was started"):
+                create_working_copy(self.source, destination)
+        self.assertFalse(destination.exists())
+        self.assertEqual((self.source / "data" / "Map001.json").read_bytes(), self.raw)
+
+    def test_all_eight_portrait_regions(self):
+        from dialogue_core import face_region
+        for index in range(8):
+            x, y = index % 4 * 144, index // 4 * 144
+            self.assertEqual(face_region(index), (x, y, x+144, y+144))
+        for index in [-1, 8, True, "1"]:
+            with self.assertRaises(SafetyError):
+                face_region(index)
 
     def test_unrelated_changes_rejected(self):
         for index in [0, 1, 4, 5, 6, 7]:

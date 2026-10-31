@@ -80,11 +80,23 @@ def create_working_copy(source: Path, destination: Path) -> Path:
     if destination.exists():
         raise SafetyError("Destination already exists. Choose a new folder for this disposable copy.")
     # Links can lead saves outside the copy. Refuse them, including Windows junctions.
-    for root, dirs, files in os.walk(source, followlinks=False):
+    size = 0
+    def walk_error(error):
+        raise error
+    for root, dirs, files in os.walk(source, followlinks=False, onerror=walk_error):
         for name in dirs + files:
             path = Path(root) / name
             if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
                 raise SafetyError("Project contains links or junctions; copying refused for safety.")
+            if path.is_file():
+                size += path.stat().st_size
+    available = shutil.disk_usage(destination.parent).free
+    required = size + max(64 * 1024 * 1024, size // 100)
+    if available < required:
+        gib = 1024 ** 3
+        raise SafetyError(f"Not enough free space. Full project copy needs about {required / gib:.2f} GiB "
+                          f"including a safety margin; destination has {available / gib:.2f} GiB free. "
+                          "No copy was started. Choose a drive with more space.")
     shutil.copytree(source, destination)
     return destination
 
@@ -100,39 +112,63 @@ class MapDocument:
         if not isinstance(self.original, dict) or not isinstance(self.original.get("events"), list):
             raise SafetyError("Unsupported map structure.")
         self.data = copy.deepcopy(self.original)
-        self.allowed: set[tuple[int, int, int]] = set()
+        # Keys refer to ORIGINAL command positions, so resizing one message cannot
+        # shift the identity of subsequent messages or unrelated commands.
+        self.edits: dict[tuple[int, int, int], tuple[str, ...]] = {}
 
     def page(self, event_index: int, page_index: int):
         return self.data["events"][event_index]["pages"][page_index]["list"]
 
     def edit(self, event_index: int, page_index: int, header_index: int, lines: list[str]):
-        commands = self.page(event_index, page_index)
+        self.validate(self.data)
+        commands = self.original["events"][event_index]["pages"][page_index]["list"]
         message = next((m for m in messages(commands) if m.header_index == header_index), None)
-        if message is None or len(lines) != len(message.lines):
-            raise SafetyError("Keep the existing number of dialogue lines and message boundaries.")
-        original_commands = self.original["events"][event_index]["pages"][page_index]["list"]
-        for index, line in zip(message.line_indices, lines):
-            old = original_commands[index]["parameters"][0]
+        if message is None:
+            raise SafetyError("Only existing Show Text messages can be edited.")
+        if tuple(lines) == message.lines:
+            proposed = dict(self.edits)
+            proposed.pop((event_index, page_index, header_index), None)
+            self.data = self._expected(proposed)
+            self.edits = proposed
+            return
+        if not 1 <= len(lines) <= 4 or len(message.lines) > 4:
+            raise SafetyError("Each message must contain one to four lines. Existing messages over four lines are read-only.")
+        for line in lines:
             if not isinstance(line, str) or "\n" in line or "\r" in line:
                 raise SafetyError("Each existing Show Text command must remain one line.")
-            if escape_codes(old) != escape_codes(line):
-                raise SafetyError("Escape codes must remain identical and in the same order on each line.")
-        for index, line in zip(message.line_indices, lines):
-            commands[index]["parameters"][0] = line
-            self.allowed.add((event_index, page_index, index))
+        old_codes = [code for line in message.lines for code in escape_codes(line)]
+        new_codes = [code for line in lines for code in escape_codes(line)]
+        if old_codes != new_codes:
+            raise SafetyError("Escape codes must remain identical and in the same order within this message.")
+        if len(lines) != len(message.lines) and any(set(commands[i]) != {"code", "indent", "parameters"}
+                                                  for i in message.line_indices):
+            raise SafetyError("Message has custom command metadata; changing its line count is unsafe.")
+        proposed = dict(self.edits)
+        proposed[event_index, page_index, header_index] = tuple(lines)
+        self.data = self._expected(proposed)
+        self.edits = proposed
+
+    def _expected(self, edits=None):
+        edits = self.edits if edits is None else edits
+        expected = copy.deepcopy(self.original)
+        # Descending ORIGINAL positions avoid index drift across multiple edits.
+        for (event, page, header), lines in sorted(edits.items(), reverse=True):
+            original = self.original["events"][event]["pages"][page]["list"]
+            message = next(m for m in messages(original) if m.header_index == header)
+            replacement = []
+            for index, line in enumerate(lines):
+                template = original[message.line_indices[min(index, len(message.line_indices) - 1)]]
+                command = copy.deepcopy(template)
+                command["parameters"][0] = line
+                replacement.append(command)
+            target = expected["events"][event]["pages"][page]["list"]
+            target[message.line_indices[0]:message.line_indices[-1] + 1] = replacement
+        return expected
 
     def validate(self, candidate):
-        expected = copy.deepcopy(self.original)
-        for event, page, command in self.allowed:
-            target = expected["events"][event]["pages"][page]["list"][command]
-            updated = candidate["events"][event]["pages"][page]["list"][command]
-            old, new = target["parameters"][0], updated["parameters"][0]
-            if target.get("code") != 401 or not isinstance(new, str) or "\n" in new or "\r" in new:
-                raise SafetyError("Invalid dialogue modification.")
-            if escape_codes(old) != escape_codes(new):
-                raise SafetyError("Escape codes changed.")
-            target["parameters"][0] = new
-        if candidate != expected:
+        expected = self._expected()
+        # Serialized comparison also distinguishes JSON booleans from numbers.
+        if json.dumps(candidate, sort_keys=True, allow_nan=False) != json.dumps(expected, sort_keys=True, allow_nan=False):
             raise SafetyError("Changes outside the intended dialogue detected. Save refused.")
 
     def save(self) -> Path | None:
@@ -176,5 +212,13 @@ class MapDocument:
                 temporary.unlink(missing_ok=True)
         self.raw = payload
         self.original = copy.deepcopy(self.data)
-        self.allowed.clear()
+        self.edits.clear()
         return backup
+
+
+def face_region(index: int) -> tuple[int, int, int, int]:
+    """MV's 4-column, 2-row face sheet uses fixed 144px cells."""
+    if type(index) is not int or not 0 <= index <= 7:
+        raise SafetyError("Unsupported face index; expected 0–7.")
+    x, y = index % 4 * 144, index // 4 * 144
+    return x, y, x + 144, y + 144
